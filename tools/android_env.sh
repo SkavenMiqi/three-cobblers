@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+export HOME=/home/skaven
+source "$HOME/android-build/venv/bin/activate"
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+export ANDROID_HOME="$HOME/android-build/sdk"
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/25.2.9519653"
+export GRADLE_USER_HOME="$HOME/android-build/gradle"
+export XDG_CACHE_HOME="$HOME/android-build/cache"
+export TMPDIR="$HOME/android-build/tmp"
+export PATH="$HOME/android-build/venv/bin:$JAVA_HOME/bin:$ANDROID_HOME/cmdline-tools/12.0/bin:$ANDROID_HOME/platform-tools:$PATH"

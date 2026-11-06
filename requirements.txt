@@ -1,0 +1,12 @@
+kivy==2.3.1
+Pillow>=10.4,<13
+certifi
+httpx
+sounddevice; sys_platform == 'win32'
+edge-tts==7.3.1
+miniaudio; sys_platform == 'win32'
+beautifulsoup4
+pypdf
+python-docx
+cryptography
+pygments
