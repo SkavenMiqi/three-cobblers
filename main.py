@@ -1,4 +1,12 @@
+import os
+import sys
 from pathlib import Path
+
+# SDL suppresses the native Windows IME candidate window by default. This
+# must be set before Kivy initializes its SDL window and text input.
+if sys.platform == 'win32':
+    os.environ['SDL_IME_SHOW_UI'] = '1'
+
 from kivy.app import App
 from kivy.core.text import LabelBase
 from kivy.core.window import Window
@@ -33,9 +41,9 @@ class TalkApp(App):
         root.add_widget(layout)
         from talkapp.safe_area import SafeArea
         self.safe_area = SafeArea(layout)
-        self.chat.progress_meter = header._system_bus.progress_meter
-        self.chat.progress_meter.open_progress = self.chat.open_progress
-        self.chat.refresh_progress()
+        self.chat.output_slider = header.output_slider
+        header.output_slider.on_change = self.chat.set_output_mode
+        self.chat.refresh_output_mode()
         from talkapp.boot import BootOverlay
         root.add_widget(BootOverlay(configured=self.chat.config.is_configured))
         return root

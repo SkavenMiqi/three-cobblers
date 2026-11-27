@@ -6,6 +6,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 from datetime import datetime
 
+from .output_modes import DEFAULT_MODE, MODES
+
 
 def data_dir():
     if "ANDROID_ARGUMENT" in os.environ:
@@ -110,7 +112,8 @@ class History:
         additions = {
             'chats': {'active_leaf': 'INTEGER', 'pinned': 'INTEGER NOT NULL DEFAULT 0',
                       'manual_title': 'INTEGER NOT NULL DEFAULT 0', 'temporary': 'INTEGER NOT NULL DEFAULT 0',
-                       'goal': "TEXT NOT NULL DEFAULT ''", 'project_id': 'INTEGER'},
+                        'goal': "TEXT NOT NULL DEFAULT ''", 'project_id': 'INTEGER',
+                        'output_mode': f'INTEGER NOT NULL DEFAULT {DEFAULT_MODE}'},
             'messages': {'parent_id': 'INTEGER', 'selected_child': 'INTEGER',
                          'state': "TEXT NOT NULL DEFAULT 'complete'", 'model': "TEXT NOT NULL DEFAULT ''",
                          'provider': "TEXT NOT NULL DEFAULT ''", 'error': "TEXT NOT NULL DEFAULT ''"}}
@@ -136,6 +139,37 @@ class History:
                 through_id INTEGER NOT NULL, text TEXT NOT NULL, model TEXT NOT NULL,
                 created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)''')
             self.db.execute('CREATE INDEX IF NOT EXISTS message_parent ON messages(chat_id,parent_id)')
+            self.db.executescript('''CREATE TABLE IF NOT EXISTS lan_replica (
+                id INTEGER PRIMARY KEY CHECK(id=1), uuid TEXT NOT NULL);
+                INSERT OR IGNORE INTO lan_replica VALUES(1,lower(hex(randomblob(16))));
+                CREATE TABLE IF NOT EXISTS lan_chats (
+                    uuid TEXT PRIMARY KEY, local_id INTEGER UNIQUE REFERENCES chats(id) ON DELETE SET NULL);
+                CREATE TABLE IF NOT EXISTS lan_messages (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT, uuid TEXT UNIQUE NOT NULL,
+                    local_id INTEGER UNIQUE REFERENCES messages(id) ON DELETE SET NULL);
+                CREATE TABLE IF NOT EXISTS lan_cursors (
+                    peer TEXT PRIMARY KEY, received INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE IF NOT EXISTS lan_restore (
+                     chat TEXT PRIMARY KEY, after_seq INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE IF NOT EXISTS lan_opencode (
+                     message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                     state TEXT NOT NULL CHECK(state IN ('outgoing','pending','running','done')));
+                 CREATE TABLE IF NOT EXISTS lan_opencode_auto_requests (
+                     message_id INTEGER PRIMARY KEY REFERENCES lan_opencode(message_id) ON DELETE CASCADE);
+                 CREATE TABLE IF NOT EXISTS opencode_local_tasks (
+                     message_id INTEGER PRIMARY KEY REFERENCES lan_opencode(message_id) ON DELETE CASCADE);
+                 CREATE TABLE IF NOT EXISTS opencode_execution_tasks (
+                     message_id INTEGER PRIMARY KEY REFERENCES lan_opencode(message_id) ON DELETE CASCADE);
+                 CREATE TABLE IF NOT EXISTS lan_progress (
+                     chat TEXT PRIMARY KEY, registers TEXT NOT NULL, seen TEXT NOT NULL, hidden TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS deleted_steps (
+                     chat_id INTEGER REFERENCES chats(id) ON DELETE CASCADE, key TEXT NOT NULL,
+                     PRIMARY KEY(chat_id,key));
+                 CREATE TABLE IF NOT EXISTS step_folds (
+                     chat_id INTEGER PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+                     summary TEXT NOT NULL, members TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS lan_progress_scan (
+                    peer TEXT PRIMARY KEY, sent TEXT NOT NULL, received TEXT NOT NULL);''')
             self.db.executescript('''CREATE TABLE IF NOT EXISTS memories (
                 id INTEGER PRIMARY KEY, text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
                 source_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
@@ -147,6 +181,9 @@ class History:
                 chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
                 chunk_key TEXT NOT NULL, text TEXT NOT NULL,
                 PRIMARY KEY(chat_id,chunk_key))''')
+            self.db.execute('''CREATE TABLE IF NOT EXISTS progress_notes (
+                source_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                title TEXT NOT NULL, text TEXT NOT NULL, PRIMARY KEY(source_id,title))''')
             self.db.executescript('''CREATE TABLE IF NOT EXISTS usage_log (
                 id INTEGER PRIMARY KEY, task TEXT, model TEXT, provider TEXT,
                 input_tokens INTEGER, output_tokens INTEGER, reported INTEGER, cost REAL,
@@ -155,7 +192,9 @@ class History:
                 id INTEGER PRIMARY KEY, message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
                 name TEXT, content TEXT);
                 CREATE TABLE IF NOT EXISTS web_sources (
-                reply_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE, content TEXT);''')
+                    reply_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE, content TEXT);''')
+            if 'cached_input_tokens' not in {row[1] for row in self.db.execute('PRAGMA table_info(usage_log)')}:
+                self.db.execute('ALTER TABLE usage_log ADD COLUMN cached_input_tokens INTEGER')
             self.db.execute('''CREATE TABLE IF NOT EXISTS progress_steps (
                 id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
                 source_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
@@ -233,6 +272,17 @@ class History:
         row = self.db.execute('SELECT text FROM drafts WHERE chat_id=?', (chat_id,)).fetchone()
         return row[0] if row else ''
 
+    def output_mode(self, chat_id):
+        row = self.db.execute('SELECT output_mode FROM chats WHERE id=?', (chat_id,)).fetchone()
+        mode = row[0] if row else DEFAULT_MODE
+        return mode if type(mode) is int and 0 <= mode < len(MODES) else DEFAULT_MODE
+
+    def set_output_mode(self, chat_id, mode):
+        if type(mode) is not int or not 0 <= mode < len(MODES):
+            raise ValueError('无效的输出模式')
+        with self.db:
+            self.db.execute('UPDATE chats SET output_mode=? WHERE id=?', (mode, chat_id))
+
     def memory_jobs(self):
         import hashlib
         jobs = []
@@ -309,7 +359,9 @@ class History:
     def project_snapshot(self, chat_id):
         project = self.project(chat_id)
         chat = self.db.execute('SELECT title,manual_title FROM chats WHERE id=?', (chat_id,)).fetchone()
+        fold = self.db.execute('SELECT summary,members FROM step_folds WHERE chat_id=?', (chat_id,)).fetchone()
         return {'project_id': project['id'], 'goal': self.goal(chat_id), 'steps': self.steps(chat_id),
+                'deleted_steps': self.deleted_step_keys(chat_id), 'step_fold': list(fold) if fold else None,
                 'title': chat['title'], 'manual_title': chat['manual_title']}
 
     def undo_action(self, action_id):
@@ -317,14 +369,28 @@ class History:
         if not row or row['undone'] or not row['before_state']:
             raise ValueError('该操作不能撤销')
         before, after = json.loads(row['before_state']), json.loads(row['after_state'])
-        if self.project_snapshot(row['chat_id']) != after:
+        current = self.project_snapshot(row['chat_id'])
+        if 'deleted_steps' not in after:
+            current.pop('deleted_steps')  # Older action records did not track local deletions.
+        if 'step_fold' not in after:
+            current.pop('step_fold')
+        if current != after:
             raise ValueError('之后已有其他修改，为避免覆盖请让AI修改具体步骤')
         with self.db:
             self.db.execute('UPDATE chats SET goal=? WHERE id=?', (before['goal'], row['chat_id']))
             self.db.execute('DELETE FROM project_steps WHERE chat_id=?', (row['chat_id'],))
             for step in before['steps']:
-                step['chat_id'] = row['chat_id']
-                self.db.execute('INSERT INTO project_steps(id,project_id,title,detail,done,active,position,chat_id) VALUES (:id,:project_id,:title,:detail,:done,:active,:position,:chat_id)', step)
+                self.db.execute('''INSERT INTO project_steps(id,project_id,title,detail,done,active,position,chat_id)
+                    VALUES (:id,:project_id,:title,:detail,:done,:active,:position,:chat_id)''',
+                    {**step, 'chat_id': row['chat_id']})
+            if 'deleted_steps' in before:
+                self.db.execute('DELETE FROM deleted_steps WHERE chat_id=?', (row['chat_id'],))
+                self.db.executemany('INSERT INTO deleted_steps VALUES (?,?)',
+                                    [(row['chat_id'], key) for key in before['deleted_steps']])
+            if 'step_fold' in before:
+                self.db.execute('DELETE FROM step_folds WHERE chat_id=?', (row['chat_id'],))
+                if before['step_fold']:
+                    self._write_step_fold(row['chat_id'], *before['step_fold'])
             self.db.execute('UPDATE chats SET title=?,manual_title=? WHERE id=?', (before['title'], before['manual_title'], row['chat_id']))
             self.db.execute('UPDATE action_log SET undone=1 WHERE id=?', (action_id,))
 
@@ -349,22 +415,150 @@ class History:
         with self.db:
             self.db.execute('UPDATE chats SET goal=? WHERE id=?', (goal, chat_id))
 
+    def goals(self, chat_id):
+        return [goal.strip() for goal in self.goal(chat_id).split('\n\n') if goal.strip()]
+
+    def set_goals(self, chat_id, goals):
+        if not isinstance(goals, list) or not all(isinstance(goal, str) and goal.strip() for goal in goals):
+            raise ValueError('每条终极目标都需要填写文字')
+        text = '\n\n'.join('\n'.join(line.strip() for line in goal.splitlines() if line.strip()) for goal in goals)
+        if len(text) > 4000:
+            raise ValueError('终极目标合计不能超过 4000 字')
+        self.set_goal(chat_id, text)
+
     def steps(self, chat_id):
         return [dict(row) for row in self.db.execute('SELECT * FROM project_steps WHERE chat_id=? ORDER BY position,id', (chat_id,))]
 
+    def save_progress_note(self, chat_id, leaf, title, text):
+        if not isinstance(text, str) or not 0 < len(text.strip()) <= 300:
+            raise ValueError('进度记录需为1–300字')
+        if self.is_temporary(chat_id) or leaf is None:
+            raise ValueError('只有普通对话才能保存进度记录')
+        source = self.node(leaf)
+        if not source or source['chat_id'] != chat_id:
+            raise ValueError('找不到当前对话的记录来源')
+        self.db.execute('INSERT OR REPLACE INTO progress_notes VALUES (?,?,?)', (leaf, title, text.strip()))
+
+    def progress_notes(self, chat_id, query, *, leaf=None, limit=3):
+        from .memory import terms
+        tokens = set(terms(query))
+        if not tokens or self.is_temporary(chat_id):
+            return []
+        path = {node['id'] for node in self.path(chat_id, leaf)}
+        matches = []
+        for row in self.db.execute('''SELECT p.source_id,p.title,p.text FROM progress_notes p
+            JOIN messages m ON m.id=p.source_id WHERE m.chat_id=? ORDER BY p.source_id DESC''', (chat_id,)):
+            if row['source_id'] in path:
+                score = len(tokens & set(terms(row['title'] + ' ' + row['text'])))
+                if score:
+                    matches.append((score, dict(row)))
+        matches.sort(key=lambda item: item[0], reverse=True)
+        return [row for _, row in matches[:limit]]
+
+    def step_fold(self, chat_id):
+        row = self.db.execute('SELECT summary,members FROM step_folds WHERE chat_id=?', (chat_id,)).fetchone()
+        if not row:
+            return '', set()
+        saved = json.loads(row[1])
+        current = [[s['id'], s['title'], s['detail']] for s in self.steps(chat_id) if s['done']]
+        # If a member changes or is reopened, no longer show its old summary.
+        if any(member not in current for member in saved):
+            return '', set()
+        return row[0], {member[0] for member in saved}
+
+    def save_step_fold(self, chat_id, summary, members):
+        current = [[s['id'], s['title'], s['detail']] for s in self.steps(chat_id) if s['done']]
+        if len(members) < 2 or not summary.strip() or any(member not in current for member in members):
+            return False
+        with self.db:
+            self._write_step_fold(chat_id, summary, json.dumps(members, ensure_ascii=False))
+        return True
+
+    def _write_step_fold(self, chat_id, summary, members_json):
+        self.db.execute('INSERT OR REPLACE INTO step_folds VALUES (?,?,?)', (chat_id, summary, members_json))
+
     def merge_steps(self, chat_id, source_id, values):
+        from .progress_sync import step_key
         if not self.node(source_id):
             return
         with self.db:
             existing = {item['title']: item for item in self.steps(chat_id)}
+            deleted = {row[0] for row in self.db.execute('SELECT key FROM deleted_steps WHERE chat_id=?', (chat_id,))}
             position = max((item['position'] for item in existing.values()), default=-1) + 1
             for item in values:
-                if item['title'] in existing:
+                if item['title'] in existing or step_key(item['title']) in deleted:
                     continue
                 self.db.execute('INSERT INTO project_steps(project_id,chat_id,title,detail,position) VALUES (?,?,?,?,?)',
                                 (self.project(chat_id)['id'], chat_id, item['title'], item['detail'], position))
                 existing[item['title']] = item
                 position += 1
+
+    def delete_step(self, chat_id, step_id):
+        from .progress_sync import step_key
+        with self.db:
+            row = self.db.execute('SELECT title FROM project_steps WHERE chat_id=? AND id=?', (chat_id, step_id)).fetchone()
+            if not row:
+                return False
+            self.db.execute('INSERT OR IGNORE INTO deleted_steps VALUES (?,?)', (chat_id, step_key(row[0])))
+            self.db.execute('DELETE FROM project_steps WHERE chat_id=? AND id=?', (chat_id, step_id))
+            return True
+
+    def deleted_step_keys(self, chat_id):
+        return [row[0] for row in self.db.execute('SELECT key FROM deleted_steps WHERE chat_id=? ORDER BY key', (chat_id,))]
+
+    def move_step(self, chat_id, step_id, number):
+        ids = [step['id'] for step in self.steps(chat_id)]
+        if type(step_id) is not int or step_id not in ids or type(number) is not int or not 1 <= number <= len(ids):
+            raise ValueError('当前对话找不到该步骤或目标序号')
+        ids.remove(step_id)
+        ids.insert(number - 1, step_id)
+        self.reorder_steps(chat_id, ids)
+
+    def reorder_steps(self, chat_id, ids, *, summary=None):
+        with self.db:
+            # Open the write transaction before reading the order and completion states.
+            self.db.execute('UPDATE project_steps SET position=position WHERE chat_id=? AND 0', (chat_id,))
+            steps = {step['id']: step for step in self.steps(chat_id)}
+            if (not isinstance(ids, list) or not all(type(item) is int for item in ids)
+                    or len(ids) != len(steps) or set(ids) != set(steps)):
+                raise ValueError('排序需要当前对话全部步骤的 ID，每项恰好一次；请重新查询进度')
+            members = []
+            if summary is not None:
+                members = [[i, steps[i]['title'], steps[i]['detail']] for i in ids if steps[i]['done']]
+                if self.is_temporary(chat_id) or len(members) < 2:
+                    raise ValueError('至少需要两项已完成步骤才能排序并折叠，顺序未更改')
+            self.db.executemany('UPDATE project_steps SET position=? WHERE id=? AND chat_id=?',
+                                [(position, item, chat_id) for position, item in enumerate(ids)])
+            if summary is not None:
+                self._write_step_fold(chat_id, summary, json.dumps(members, ensure_ascii=False))
+        return len(members)
+
+    def combine_steps(self, chat_id, ids, title):
+        from .progress_sync import step_key
+        steps = self.steps(chat_id)
+        if not isinstance(ids, list) or not all(type(item) is int for item in ids) or len(set(ids)) < 2:
+            raise ValueError('合并至少需要两个不同的步骤 ID')
+        selected = [step for step in steps if step['id'] in ids]
+        if len(selected) != len(ids):
+            raise ValueError('合并步骤必须互不重复且都在当前对话中')
+        key = step_key(title)
+        if any(step_key(step['title']) == key for step in steps if step['id'] not in ids):
+            raise ValueError('合并后的标题与其他步骤重复')
+        first, *rest = selected
+        detail = '\n\n'.join(f"{step['title']}\n{step['detail']}".strip() for step in selected)
+        if len(detail) > 4000:
+            raise ValueError('合并后的说明超过 4000 字，请分批合并')
+        done = all(step['done'] for step in selected)
+        active = not done and any(step['active'] for step in selected)
+        with self.db:
+            self.db.executemany('INSERT OR IGNORE INTO deleted_steps VALUES (?,?)',
+                                [(chat_id, step_key(step['title'])) for step in selected if step_key(step['title']) != key])
+            self.db.executemany('DELETE FROM project_steps WHERE chat_id=? AND id=?',
+                                [(chat_id, step['id']) for step in rest])
+            self.db.execute('UPDATE project_steps SET title=?,detail=?,done=?,active=? WHERE id=?',
+                            (title, detail, int(done), int(active), first['id']))
+            self.db.execute('DELETE FROM deleted_steps WHERE chat_id=? AND key=?', (chat_id, key))
+        return first['id'], done
 
     def step_state(self, step_id, done=None, active=None):
         row = self.db.execute('SELECT chat_id FROM project_steps WHERE id=?', (step_id,)).fetchone()
@@ -379,8 +573,13 @@ class History:
 
     def usage(self, record):
         with self.db:
-            self.db.execute('''INSERT INTO usage_log(task,model,provider,input_tokens,output_tokens,reported,cost)
-                VALUES (:task,:model,:provider,:input_tokens,:output_tokens,:reported,:cost)''', record)
+            self.db.execute('''INSERT INTO usage_log(task,model,provider,input_tokens,output_tokens,reported,cost,cached_input_tokens)
+                VALUES (:task,:model,:provider,:input_tokens,:output_tokens,:reported,:cost,:cached_input_tokens)''',
+                            {'cached_input_tokens': None, **record})
+
+    def today_usage(self):
+        return self.db.execute('''SELECT COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) AS tokens,
+            SUM(cost) AS cost FROM usage_log WHERE date(created, 'localtime') = date('now', 'localtime')''').fetchone()
 
     def attach(self, message_id, files):
         with self.db:
@@ -513,7 +712,8 @@ class History:
     def messages(self, chat_id):
         return [(node['role'], node['text'], node['image']) for node in self.path(chat_id)]
 
-    def append(self, chat_id, role, text, image=None, *, parent='active', state='complete', model='', provider=''):
+    def append(self, chat_id, role, text, image=None, *, parent='active', state='complete', model='', provider='', lan_opencode=False,
+               local_opencode=False):
         if parent == 'active':
             path = self.path(chat_id)
             parent = path[-1]['id'] if path else None
@@ -522,19 +722,31 @@ class History:
             if not ancestor or ancestor['chat_id'] != chat_id:
                 raise ValueError('消息不属于当前对话')
         with self.db:
+            if lan_opencode or local_opencode:
+                from .lan_opencode import valid_prompt
+                if role != 'user' or state != 'complete' or image is not None or self.is_temporary(chat_id) or not valid_prompt(text):
+                    raise ValueError('只能在普通对话中提交纯文字 OpenCode 请求')
             if role == "user" and not self.messages(chat_id):
                 self.db.execute("UPDATE chats SET title=? WHERE id=?", ((text or "图片对话")[:24], chat_id))
             message_id = self.db.execute('''INSERT INTO messages(chat_id,role,text,image,parent_id,state,model,provider)
                 VALUES (?,?,?,?,?,?,?,?)''', (chat_id, role, text, image, parent, state, model, provider)).lastrowid
+            if lan_opencode or local_opencode:
+                self.db.execute('INSERT INTO lan_opencode VALUES (?,?)', (message_id, 'pending' if local_opencode else 'outgoing'))
+                self.db.execute('INSERT INTO lan_opencode_auto_requests VALUES (?)', (message_id,))
+                self.db.execute('INSERT INTO opencode_execution_tasks VALUES (?)', (message_id,))
+                if local_opencode:
+                    self.db.execute('INSERT INTO opencode_local_tasks VALUES (?)', (message_id,))
             if parent:
                 self.db.execute('UPDATE messages SET selected_child=? WHERE id=?', (message_id, parent))
             self.db.execute('UPDATE chats SET active_leaf=? WHERE id=?', (message_id, chat_id))
             self.db.execute("UPDATE chats SET updated=CURRENT_TIMESTAMP WHERE id=?", (chat_id,))
         return message_id
 
-    def checkpoint(self, message_id, text, state='generating', error=''):
+    def checkpoint(self, message_id, text, state='generating', error='', *, image=None):
         with self.db:
             self.db.execute('UPDATE messages SET text=?,state=?,error=? WHERE id=?', (text, state, error, message_id))
+            if state == 'complete' and image:
+                self.db.execute('UPDATE messages SET image=? WHERE id=? AND role=\'assistant\'', (image, message_id))
             if state != 'generating':
                 self.db.execute('UPDATE chats SET updated=CURRENT_TIMESTAMP WHERE id=(SELECT chat_id FROM messages WHERE id=?)', (message_id,))
 

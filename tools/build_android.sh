@@ -8,6 +8,7 @@ mkdir -p "$BUILD" "$TMPDIR" "$XDG_CACHE_HOME" "$GRADLE_USER_HOME"
 # Compile on ext4 inside the F:-backed VHD, avoiding NTFS symlink/case issues.
 rsync -a --exclude .git --exclude fitness --exclude fitness-original --exclude backups --exclude .venv --exclude .buildozer \
     --exclude bin --exclude __pycache__ --exclude '*.zip' "$SOURCE/" "$BUILD/"
+python "$BUILD/tools/build_harness_bundle.py" "$BUILD/talkapp"
 export APP_ANDROID_SDK_PATH="$ANDROID_HOME"
 export APP_ANDROID_NDK_PATH="$ANDROID_NDK_HOME"
 export APP_ANDROID_NDK=25c

@@ -12,10 +12,14 @@ from PIL import Image, ImageOps
 
 def image_data(path):
     with Image.open(path) as original:
-        image = ImageOps.exif_transpose(original)
-        image.thumbnail((1600, 1600))
-        output = io.BytesIO()
-        image.convert("RGB").save(output, format="JPEG", quality=85)
+        # JPEG draft asks the decoder for a reduced raster before allocating
+        # full-resolution pixels. Shrink before EXIF transpose (which copies).
+        original.draft('RGB', (1600, 1600))
+        original.thumbnail((1600, 1600))
+        with ImageOps.exif_transpose(original) as image:
+            output = io.BytesIO()
+            with image.convert("RGB") as rgb:
+                rgb.save(output, format="JPEG", quality=85)
     return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
 
 
@@ -66,6 +70,20 @@ def messages_for_api(rows, prompt, *, prepared=False):
                 {"type": "image_url", "image_url": {"url": value}} for value in image_list(image)]
         messages.append({"role": role, "content": content})
     return messages
+
+
+def cached_input_tokens(usage):
+    """None means the provider did not explicitly report a cache count."""
+    for key in ('prompt_tokens_details', 'input_tokens_details'):
+        fields = usage.get(key)
+        value = fields.get('cached_tokens') if isinstance(fields, dict) else None
+        if type(value) is int and value >= 0:
+            return value
+    for key in ('prompt_cache_hit_tokens', 'cache_read_input_tokens'):
+        value = usage.get(key)
+        if type(value) is int and value >= 0:
+            return value
+    return None
 
 
 def stream_reply(config, rows, on_delta, cancel, *, prompt=None, prepared=False, task='chat', on_usage=None,
@@ -163,7 +181,8 @@ def stream_reply(config, rows, on_delta, cancel, *, prompt=None, prepared=False,
             outgoing = int(usage.get('completion_tokens', usage.get('output_tokens', 0))) if reported else int(estimate(text)) if text else 0
             cost = (incoming * config.input_price + outgoing * config.output_price) / 1000000 if reported and (config.input_price or config.output_price) else None
             on_usage(dict(task=task, model=config.model, provider=urllib.parse.urlparse(base).hostname,
-                          input_tokens=incoming, output_tokens=outgoing, reported=int(reported), cost=cost))
+                          input_tokens=incoming, output_tokens=outgoing, reported=int(reported), cost=cost,
+                          cached_input_tokens=cached_input_tokens(usage) if reported else None))
     if not cancel.is_set() and not finished:
         raise ValueError('连接提前结束，已保存部分回答，可重试')
     if on_tools and not cancel.is_set():

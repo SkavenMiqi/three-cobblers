@@ -18,10 +18,8 @@ class ReadingConfig:
             return cls()
 
     def save(self):
-        from urllib.parse import urlparse
-        url = urlparse(self.search_endpoint)
-        if url.scheme != 'https' or not url.hostname:
-            raise ValueError('搜索接口需要HTTPS')
+        if self.mode not in ('auto', 'on', 'off'):
+            raise ValueError('联网模式无效')
         path = data_dir() / 'reading.json'
         temporary = path.with_suffix('.tmp')
         temporary.write_text(json.dumps(asdict(self), ensure_ascii=False), encoding='utf-8')

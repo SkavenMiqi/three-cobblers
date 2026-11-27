@@ -10,6 +10,16 @@ from utils import fx
 from utils.appearance import state as appearance
 
 
+class DisplayTextInput(TextInput):
+    """Text display with no selection or clipboard gestures; parent handles scrolling."""
+
+    def __init__(self, **kwargs):
+        super().__init__(readonly=True, is_focusable=False, use_bubble=False, use_handles=False, **kwargs)
+
+    def on_touch_down(self, touch):
+        return False
+
+
 def surface(widget, color, edge=None, top=False):
     with widget.canvas.before:
         Color(*color)
@@ -29,6 +39,7 @@ def surface(widget, color, edge=None, top=False):
 class Bubble(BoxLayout):
     def __init__(self, kind, text, **kwargs):
         bg, fg = (theme.VFD_BLUE, theme.CHASSIS) if kind == "user" else (theme.DISPLAY_GLASS, theme.TEXT_PRIMARY)
+        self.kind = kind
         super().__init__(orientation="vertical", size_hint_y=None,
                          padding=[dp(12), dp(8)], spacing=dp(2), **kwargs)
         self.bind(minimum_height=self.setter("height"))
@@ -45,7 +56,7 @@ class Bubble(BoxLayout):
                               halign="left", valign="middle")
         self.add_widget(source)
         self.source_label = source
-        self.content = TextInput(text=text, readonly=True, font_size=dp(15) * appearance.font_scale, foreground_color=fg,
+        self.content = DisplayTextInput(text=text, font_size=dp(15) * appearance.font_scale, foreground_color=fg,
                                  background_normal="", background_active="", background_color=(0, 0, 0, 0),
                                  cursor_color=(0, 0, 0, 0), padding=[dp(2), dp(2)], size_hint_y=None)
         def resize(*_):
@@ -53,10 +64,13 @@ class Bubble(BoxLayout):
                 len(self.content._lines) * self.content.line_height + dp(6))))
         self.content.bind(width=resize, text=resize)
         self.add_widget(self.content)
-        def update_theme(*_):
-            if kind == 'user':
-                self.content.foreground_color = theme.TEXT_PRIMARY if appearance.enhanced else theme.CHASSIS
-                source.color = theme.VFD_BLUE if appearance.enhanced else theme.CHASSIS
-        appearance.bind(enhanced=update_theme)
-        update_theme()
+        # Kivy weakly binds instance methods. A closure here retained every
+        # discarded user bubble via the global appearance singleton.
+        appearance.bind(enhanced=self.update_theme)
+        self.update_theme()
         resize()
+
+    def update_theme(self, *_):
+        if self.kind == 'user':
+            self.content.foreground_color = theme.TEXT_PRIMARY if appearance.enhanced else theme.CHASSIS
+            self.source_label.color = theme.VFD_BLUE if appearance.enhanced else theme.CHASSIS

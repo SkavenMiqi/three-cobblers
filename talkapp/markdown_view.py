@@ -2,17 +2,15 @@
 import re
 import webbrowser
 
-from kivy.core.clipboard import Clipboard
 from kivy.metrics import dp
 from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.gridlayout import GridLayout
-from kivy.uix.textinput import TextInput
 from kivy.uix.codeinput import CodeInput
 from kivy.utils import escape_markup
 
 from . import theme
+from .legacy_widgets import DisplayTextInput
 from utils.appearance import state as appearance
 
 
@@ -45,16 +43,18 @@ def blocks(text):
     return result
 
 
+class DisplayCodeInput(DisplayTextInput, CodeInput):
+    pass
+
+
 class MarkdownView(BoxLayout):
     def __init__(self, text='', **kwargs):
         super().__init__(orientation='vertical', size_hint_y=None, spacing=dp(6), **kwargs)
         self.bind(minimum_height=self.setter('height'))
         for kind, value, language in blocks(text):
             if kind == 'code':
-                header = Button(text=(language or '代码') + ' / 复制代码', size_hint_y=None, height=dp(28),
-                                font_size=dp(11), background_normal='', background_color=theme.METAL_DARK,
-                                color=theme.VFD_CYAN)
-                header.bind(on_release=lambda _, code=value: Clipboard.copy(code))
+                header = Label(text=language or '代码', size_hint_y=None, height=dp(28),
+                               font_size=dp(11), color=theme.VFD_CYAN)
                 self.add_widget(header)
                 self.add_raw(value, language)
             else:
@@ -67,7 +67,7 @@ class MarkdownView(BoxLayout):
             lexer = get_lexer_by_name(language or 'text')
         except ClassNotFound:
             lexer = TextLexer()
-        view = CodeInput(text=text, lexer=lexer, style_name='monokai', readonly=True, size_hint_y=None, font_size=dp(14) * appearance.font_scale,
+        view = DisplayCodeInput(text=text, lexer=lexer, style_name='monokai', size_hint_y=None, font_size=dp(14) * appearance.font_scale,
                          background_normal='', background_active='', background_color=theme.DISPLAY_GLASS,
                          foreground_color=theme.TEXT_PRIMARY, padding=[dp(8), dp(6)])
         def resize(*_):

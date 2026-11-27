@@ -47,7 +47,7 @@ class BootOverlay(FloatLayout):
         self.events = [Clock.schedule_once(self.ignite, .04),
                        Clock.schedule_once(lambda _: self.stage(18, 'CORE BUS        /   INITIALIZED'), .12),
                        Clock.schedule_once(lambda _: self.stage(42, 'LOCAL HISTORY   /   READY'), .25),
-                       Clock.schedule_once(lambda _: self.stage(68, 'PROJECT & PST   /   READY'), .38),
+                       Clock.schedule_once(lambda _: self.stage(68, 'PROJECT & OUTPUT   /   READY'), .38),
                        Clock.schedule_once(lambda _: self.stage(88, 'AI CONFIG       /   ' + ('LOADED' if configured else 'NOT SET')), .52),
                        Clock.schedule_once(lambda _: self.stage(100, 'TERMINAL ONLINE /   对话终端就绪'), .67),
                        Clock.schedule_once(self.finish, .82)]

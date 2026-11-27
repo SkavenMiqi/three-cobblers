@@ -7,12 +7,66 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
-from talkapp.client import stream_reply
+from talkapp.client import cached_input_tokens, stream_reply
 from talkapp.storage import Config, History
+from talkapp import web_tools
 from talkapp.reading import read_document, fetch_page, search_web, needs_search, select_passages
 
 
 class ReadingUsageTests(unittest.TestCase):
+    def test_today_usage_excludes_other_days(self):
+        history = History(':memory:')
+        try:
+            self.assertEqual(tuple(history.today_usage()), (0, None))
+            history.db.executescript('''INSERT INTO usage_log (input_tokens, output_tokens, cost, created) VALUES
+                (100, 20, .05, CURRENT_TIMESTAMP), (200, 30, NULL, CURRENT_TIMESTAMP),
+                (900, 100, 1, datetime('now', '-1 day')),
+                (900, 100, 1, datetime('now', '+1 day'));''')
+            self.assertEqual(tuple(history.today_usage()), (350, .05))
+        finally:
+            history.close()
+
+    def test_cache_usage_distinguishes_zero_from_unreported(self):
+        self.assertIsNone(cached_input_tokens({'prompt_tokens': 1200}))
+        self.assertEqual(cached_input_tokens({'prompt_tokens_details': {'cached_tokens': 0}}), 0)
+        self.assertEqual(cached_input_tokens({'prompt_cache_hit_tokens': 1024}), 1024)
+        history = History(':memory:')
+        try:
+            record = dict(task='chat', model='test', provider='test', input_tokens=1200,
+                          output_tokens=30, reported=1, cost=None)
+            history.usage(record)
+            history.usage(dict(record, cached_input_tokens=0))
+            self.assertEqual([row[0] for row in history.db.execute(
+                'SELECT cached_input_tokens FROM usage_log ORDER BY id')], [None, 0])
+        finally:
+            history.close()
+
+    def test_keyless_search_extracts_real_source_and_read_requires_allowed_link(self):
+        html = ('<div class="result"><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fnews">News</a>'
+                '<div class="result__snippet">Actual snippet</div></div>')
+
+        def handler(request):
+            self.assertEqual(request.url.host, 'html.duckduckgo.com')
+            self.assertEqual(request.content, b'q=yesterday+news')
+            self.assertNotIn('authorization', request.headers)
+            return httpx.Response(200, text=html)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch.object(web_tools.httpx, 'Client', return_value=client):
+            page, = web_tools.search({'query': 'yesterday news'})
+        self.assertEqual(page['url'], 'https://example.com/news')
+        with patch.object(web_tools, 'fetch_page', return_value=dict(page, text='a' * 1800)) as fetch:
+            with self.assertRaises(ValueError):
+                web_tools.read({'url': 'http://127.0.0.1'}, {page['url']})
+            fetch.assert_not_called()
+            self.assertEqual(len(web_tools.read({'url': page['url']}, {page['url']})['text']), 1300)
+
+    def test_challenge_is_not_reported_as_empty_search(self):
+        client = httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(202, text='<form>challenge</form>')))
+        with patch.object(web_tools.httpx, 'Client', return_value=client):
+            with self.assertRaisesRegex(ValueError, '限流'):
+                web_tools.search({'query': 'news'})
+
     def test_text_docx_pdf_and_limits(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / '资料.md'

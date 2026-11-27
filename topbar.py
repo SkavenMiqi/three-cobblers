@@ -1,6 +1,5 @@
 from datetime import datetime, timedelta
 import os
-import weakref
 
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
@@ -13,7 +12,7 @@ from kivy.metrics import dp
 from config import theme
 from utils.instrument import StatusLamp
 from talkapp import header_data as db
-from talkapp.storage import Config as LLMConfig
+from talkapp.output_modes import DEFAULT_MODE, MODES
 import sounds
 
 
@@ -47,98 +46,56 @@ class HamburgerButton(Button):
                 Rectangle(pos=(x, cy + (i - 1) * (h + gap)), size=(w, h))
 
 
-class RestTimerController:
-    """Single wall-clock timer shared by every page's persistent topbar."""
+class OutputModeSlider(Widget):
+    COLORS = (theme.VFD_BLUE, theme.LED_GREEN, theme.VFD_ORANGE, (.78, .55, 1, 1))
 
-    def __init__(self):
-        self._meters = weakref.WeakSet()
-        self._event = Clock.schedule_interval(self._tick, 0.25)
-
-    def register(self, meter):
-        self._meters.add(meter)
-        self._tick()
-
-    def start_current(self):
-        current = next((item for item in db.get_today_plan() if not item["completed"]), None)
-        if current is None or current["item_type"] != "strength":
-            return False
-        duration = int(current.get("target_rest_seconds") or 120)
-        if not db.start_rest_timer(current["id"], duration):
-            return False
-        sounds.play_click()
-        self._tick()
-        return True
-
-    def _tick(self, *_):
-        session = db.get_today_training_session()
-        progress = 0.0
-        remaining = None
-        complete = False
-        if session and session.get("rest_ends_at") and session.get("rest_duration_seconds"):
-            try:
-                ends_at = datetime.fromisoformat(session["rest_ends_at"])
-                duration = max(1, int(session["rest_duration_seconds"]))
-                remaining_float = (ends_at - datetime.now()).total_seconds()
-                remaining = max(0, int(remaining_float + 0.999))
-                progress = min(1.0, max(0.0, 1.0 - remaining_float / duration))
-                complete = remaining_float <= 0
-            except (TypeError, ValueError):
-                pass
-        for meter in tuple(self._meters):
-            meter.set_timer_state(progress, remaining, complete)
-        if complete and session and not session.get("rest_notified"):
-            if db.mark_rest_timer_notified():
-                sounds.play_rest_complete()
-        return True
-
-
-_REST_TIMER = RestTimerController()
-
-
-class BusMeter(Widget):
-    """Clickable between-set recovery timer progress."""
-
-    def __init__(self, **kwargs):
+    def __init__(self, status_label, **kwargs):
         super().__init__(**kwargs)
-        self._progress = 0.0
-        self.open_progress = None
-        self._complete = False
-        self.status_label = None
+        self.mode = DEFAULT_MODE
+        self.on_change = None
+        self.status_label = status_label
         with self.canvas:
-            self._bg_color = Color(*theme.DISPLAY_GLASS)
+            Color(*theme.DISPLAY_GLASS)
             self._bg = Rectangle(pos=self.pos, size=self.size)
-            self._edge_color = Color(*theme.METAL_DARK)
+            Color(*theme.METAL_DARK)
             self._edge = Line(rectangle=(*self.pos, *self.size), width=dp(0.8))
             self._segments = []
-            for _ in range(10):
-                color = Color(*theme.VFD_BLUE_DIM)
-                rect = Rectangle(pos=self.pos, size=(0, 0))
-                self._segments.append((color, rect))
+            for _ in MODES:
+                self._segments.append((Color(*theme.METAL_DARK), Rectangle()))
         self.bind(pos=self._draw, size=self._draw)
+        self.set_mode(DEFAULT_MODE)
+
+    def set_mode(self, mode):
+        self.mode = mode
+        self.status_label.text = MODES[mode][0]
+        self.status_label.color = self.COLORS[mode]
         self._draw()
 
-    def set_timer_state(self, progress, remaining, complete):
-        self._progress = progress
-        self._complete = complete
-        if self.status_label is not None:
-            self.status_label.text = "RST" if remaining is None else str(remaining)
-            self.status_label.color = (theme.LED_GREEN if complete else
-                                       theme.VFD_ORANGE if remaining is not None else
-                                       theme.TEXT_MUTED)
-        self._draw()
+    def _select_at(self, x):
+        mode = int((x - self.x) * len(MODES) / max(1, self.width))
+        mode = min(len(MODES) - 1, max(0, mode))
+        if mode != self.mode:
+            self.set_mode(mode)
+            if self.on_change:
+                self.on_change(mode)
 
     def on_touch_down(self, touch):
-        if self.collide_point(*touch.pos):
+        if not touch.is_mouse_scrolling and self.collide_point(*touch.pos):
             touch.grab(self)
+            self._select_at(touch.x)
             return True
         return super().on_touch_down(touch)
+
+    def on_touch_move(self, touch):
+        if touch.grab_current is self:
+            self._select_at(touch.x)
+            return True
+        return super().on_touch_move(touch)
 
     def on_touch_up(self, touch):
         if touch.grab_current is self:
             touch.ungrab(self)
-            if self.collide_point(*touch.pos):
-                if self.open_progress:
-                    self.open_progress()
+            self._select_at(touch.x)
             return True
         return super().on_touch_up(touch)
 
@@ -147,22 +104,15 @@ class BusMeter(Widget):
         self._bg.size = self.size
         self._edge.rectangle = (*self.pos, *self.size)
         gap = dp(2)
-        segment_w = max(dp(2), (self.width - gap * 9 - dp(6)) / len(self._segments))
+        segment_w = max(0, (self.width - gap * (len(MODES) - 1) - dp(6)) / len(MODES))
         segment_h = max(dp(2), self.height - dp(6))
         x = self.x + dp(3)
         y = self.y + dp(3)
-        lit_count = int(self._progress * len(self._segments) + 0.999)
         for index, (color, rect) in enumerate(self._segments):
-            if index < lit_count:
-                color.rgba = theme.LED_GREEN if self._complete else theme.VFD_ORANGE
-            else:
-                color.rgba = theme.METAL_DARK
+            color.rgba = self.COLORS[self.mode] if index <= self.mode else theme.METAL_DARK
             rect.pos = (x, y)
             rect.size = (segment_w, segment_h)
             x += segment_w + gap
-
-    def stop(self):
-        pass
 
 
 class SystemBus(BoxLayout):
@@ -170,7 +120,7 @@ class SystemBus(BoxLayout):
 
     def __init__(self, **kwargs):
         super().__init__(orientation="vertical", size_hint=(None, None),
-                         size=(dp(158), dp(44)), padding=[dp(5), dp(3)],
+                         size=(dp(136), dp(46)), padding=[dp(5), dp(3)],
                          spacing=dp(2), **kwargs)
         with self.canvas.before:
             Color(*theme.PANEL)
@@ -203,24 +153,21 @@ class SystemBus(BoxLayout):
             label.bind(size=label.setter("text_size"))
             rail.add_widget(label)
             lamp = StatusLamp(color=color, breathe=breathe,
-                              size=(dp(20), dp(3)), pos_hint={"center_y": 0.5})
+                              size=(dp(15), dp(3)), pos_hint={"center_y": 0.5})
             if label_text == "AI":
                 self._ai_lamp = lamp
             rail.add_widget(lamp)
             rails.add_widget(rail)
         self.add_widget(rails)
 
-        scan_row = BoxLayout(size_hint_y=None, height=dp(11), spacing=dp(4))
-        scan_label = Label(text="PST", color=theme.TEXT_MUTED, font_size=dp(8),
-                           size_hint_x=None, width=dp(24), halign="left", valign="middle")
-        scan_label.bind(size=scan_label.setter("text_size"))
-        scan_row.add_widget(scan_label)
-        meter = BusMeter()
-        self.progress_meter = meter
-        meter.status_label = scan_label
-        _REST_TIMER._tick()
-        scan_row.add_widget(meter)
-        self.add_widget(scan_row)
+        mode_row = BoxLayout(size_hint_y=None, height=dp(15), spacing=dp(4))
+        mode_label = Label(font_size=dp(10), size_hint_x=None, width=dp(24),
+                           halign="left", valign="middle")
+        mode_label.bind(size=mode_label.setter("text_size"))
+        mode_row.add_widget(mode_label)
+        self.output_slider = OutputModeSlider(mode_label)
+        mode_row.add_widget(self.output_slider)
+        self.add_widget(mode_row)
         self._timer = Clock.schedule_interval(self._refresh_time, 1.0)
         self._refresh_time()
 
@@ -274,9 +221,7 @@ class SystemBus(BoxLayout):
             self._timer.cancel()
             self._timer = None
         for widget in self.walk():
-            if isinstance(widget, BusMeter):
-                widget.stop()
-            elif isinstance(widget, StatusLamp):
+            if isinstance(widget, StatusLamp):
                 widget.stop()
 
 
@@ -401,6 +346,7 @@ class TopBar(BoxLayout):
                                      allow_stretch=True, keep_ratio=True))
         self.add_widget(logo_holder)
         self._system_bus = SystemBus()
+        self.output_slider = self._system_bus.output_slider
         self.add_widget(self._system_bus)
         self.bind(width=self._resize_modules)
         self._resize_modules()
@@ -411,7 +357,7 @@ class TopBar(BoxLayout):
         available = max(0, self.width - dp(16))
         module_width = min(dp(158), max(dp(132), (available - dp(24)) / 2))
         self._channel_display.width = module_width
-        self._system_bus.width = module_width
+        self._system_bus.width = min(dp(136), module_width)
 
     def _update_rect(self, *args):
         self._rect.size = self.size

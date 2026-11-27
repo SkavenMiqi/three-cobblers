@@ -10,3 +10,4 @@ pypdf
 python-docx
 cryptography
 pygments
+qrcode==8.2
